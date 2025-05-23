@@ -24,6 +24,7 @@ var (
 	clientMode = flag.Bool("client", false, "Run as client")
 	serverAddr = flag.String("serveraddr", "", "Server address to connect to as client")
 	passphrase = flag.String("passphrase", "", "Passphrase for initialization (optional, will prompt if empty)")
+	verbose    = flag.Bool("verbose", false, "Enable verbose logging")
 )
 
 var upgrader = websocket.Upgrader{
@@ -77,73 +78,13 @@ func publicKeyFingerprint(pub ssh.PublicKey) string {
 	return fmt.Sprintf("%x", hash[:6])
 }
 
-type Client struct {
-	conn      *websocket.Conn
-	username  string
-	pubKey    ssh.PublicKey
-	pubKeyStr string
-	mu        sync.Mutex
-}
-
-func (c *Client) sendMessage(msg string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.conn.WriteMessage(websocket.TextMessage, []byte(msg))
-}
-
-type Server struct {
-	clients    map[*Client]bool
-	register   chan *Client
-	unregister chan *Client
-	mu         sync.Mutex
-}
-
-func NewServer() *Server {
-	return &Server{
-		clients:    make(map[*Client]bool),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-	}
-}
-
-func (s *Server) run() {
-	for {
-		select {
-		case client := <-s.register:
-			s.mu.Lock()
-			s.clients[client] = true
-			s.mu.Unlock()
-			log.Printf("Client connected: %s", client.username)
-			s.broadcast(fmt.Sprintf("*** %s joined the chat ***", client.username), client)
-		case client := <-s.unregister:
-			s.mu.Lock()
-			if _, ok := s.clients[client]; ok {
-				delete(s.clients, client)
-				client.conn.Close()
-				s.broadcast(fmt.Sprintf("*** %s left the chat ***", client.username), client)
-			}
-			s.mu.Unlock()
-		}
-	}
-}
-
-func (s *Server) broadcast(message string, ignore *Client) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for client := range s.clients {
-		if client != ignore {
-			err := client.sendMessage(message)
-			if err != nil {
-				log.Printf("Error sending to %s: %v", client.username, err)
-			}
-		}
-	}
-}
-
 func handshake(conn *websocket.Conn, signer ssh.Signer, passphrase string) (ssh.PublicKey, string, error) {
 	pubKey := signer.PublicKey()
 	pubKeyStr := string(ssh.MarshalAuthorizedKey(pubKey))
 
+	if *verbose {
+		log.Printf("Sending public key: %s", publicKeyFingerprint(pubKey))
+	}
 	if err := conn.WriteMessage(websocket.TextMessage, []byte("PUBKEY:"+pubKeyStr)); err != nil {
 		return nil, "", fmt.Errorf("failed to send public key: %w", err)
 	}
@@ -152,16 +93,21 @@ func handshake(conn *websocket.Conn, signer ssh.Signer, passphrase string) (ssh.
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to read peer pub key: %w", err)
 	}
+	if *verbose {
+		log.Printf("Received peer pub key message")
+	}
 
 	peerMsg := string(msg)
 	if !strings.HasPrefix(peerMsg, "PUBKEY:") {
 		return nil, "", fmt.Errorf("expected PUBKEY message, got: %s", peerMsg)
 	}
 	peerPubKeyStr := peerMsg[len("PUBKEY:"):]
-
 	peerPubKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(peerPubKeyStr))
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to parse peer public key: %w", err)
+	}
+	if *verbose {
+		log.Printf("Parsed peer public key: %s", publicKeyFingerprint(peerPubKey))
 	}
 
 	if passphrase != "" {
@@ -171,6 +117,9 @@ func handshake(conn *websocket.Conn, signer ssh.Signer, passphrase string) (ssh.
 			return nil, "", fmt.Errorf("failed to sign challenge: %w", err)
 		}
 
+		if *verbose {
+			log.Printf("Sending signature challenge")
+		}
 		sigMsg := "SIG:" + string(sig.Blob)
 		if err := conn.WriteMessage(websocket.TextMessage, []byte(sigMsg)); err != nil {
 			return nil, "", fmt.Errorf("failed to send signature: %w", err)
@@ -191,47 +140,16 @@ func handshake(conn *websocket.Conn, signer ssh.Signer, passphrase string) (ssh.
 		if err := peerPubKey.Verify([]byte(peerChallenge), peerSig); err != nil {
 			return nil, "", fmt.Errorf("peer signature verification failed: %w", err)
 		}
+		if *verbose {
+			log.Printf("Peer signature verified successfully")
+		}
 	}
-
 	return peerPubKey, peerPubKeyStr, nil
 }
 
-func handleClientConnection(s *Server, conn *websocket.Conn, signer *SSHAgentSigner, passphrase string) {
-	defer conn.Close()
-
-	peerPubKey, peerPubKeyStr, err := handshake(conn, signer.signer, passphrase)
-	if err != nil {
-		log.Printf("Handshake failed: %v", err)
-		return
-	}
-
-	username := publicKeyFingerprint(peerPubKey)
-
-	client := &Client{
-		conn:      conn,
-		username:  username,
-		pubKey:    peerPubKey,
-		pubKeyStr: peerPubKeyStr,
-	}
-
-	s.register <- client
-
-	for {
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			log.Printf("Read error from %s: %v", client.username, err)
-			break
-		}
-
-		s.broadcast(fmt.Sprintf("[%s] %s", client.username, string(message)), client)
-	}
-
-	s.unregister <- client
-}
-
-func runServer(listen string, port int, signer *SSHAgentSigner, passphrase string) error {
-	s := NewServer()
-	go s.run()
+func runServerAsClient(listen string, port int, signer *SSHAgentSigner, passphrase string) error {
+	clients := make(map[string]*websocket.Conn)
+	var mu sync.Mutex
 
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -239,17 +157,135 @@ func runServer(listen string, port int, signer *SSHAgentSigner, passphrase strin
 			log.Printf("Upgrade error: %v", err)
 			return
 		}
-		go handleClientConnection(s, conn, signer, passphrase)
+
+		peerKey, _, err := handshake(conn, signer.signer, passphrase)
+		if err != nil {
+			log.Printf("Handshake failed: %v", err)
+			conn.Close()
+			return
+		}
+
+		username := publicKeyFingerprint(peerKey)
+		if *verbose {
+			log.Printf("Client connected: %s", username)
+		}
+
+		mu.Lock()
+		clients[username] = conn
+		mu.Unlock()
+
+		defer func() {
+			mu.Lock()
+			delete(clients, username)
+			mu.Unlock()
+			conn.Close()
+			if *verbose {
+				log.Printf("Client disconnected: %s", username)
+			}
+		}()
+
+		// Notify all clients of the new join (including server console)
+		msg := fmt.Sprintf("** %s joined **", username)
+		if *verbose {
+			log.Printf(msg)
+		}
+		broadcast(msg, username, clients, &mu)
+
+		for {
+			_, message, err := conn.ReadMessage()
+			if err != nil {
+				if *verbose {
+					log.Printf("Read error from %s: %v", username, err)
+				}
+				break
+			}
+			text := string(message)
+			if *verbose {
+				log.Printf("Received from %s: %s", username, text)
+			}
+			broadcast(fmt.Sprintf("[%s] %s", username, text), username, clients, &mu)
+		}
 	})
 
 	addr := fmt.Sprintf("%s:%d", listen, port)
-	log.Printf("ShitShat server listening on %s", addr)
-	return http.ListenAndServe(addr, nil)
+	if *verbose {
+		log.Printf("ShitShat server listening on %s", addr)
+	}
+	go func() {
+		if err := http.ListenAndServe(addr, nil); err != nil {
+			log.Fatalf("HTTP server error: %v", err)
+		}
+	}()
+
+	// Server acts also as client connecting to itself
+	return runClient(fmt.Sprintf("localhost:%d", port), signer, passphrase)
+}
+
+func broadcast(message string, sender string, clients map[string]*websocket.Conn, mu *sync.Mutex) {
+	mu.Lock()
+	defer mu.Unlock()
+	for username, conn := range clients {
+		if username == sender {
+			continue // Don't send to sender
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+			if *verbose {
+				log.Printf("Broadcast error to %s: %v", username, err)
+			}
+		}
+	}
+}
+
+func runSingleClient(conn *websocket.Conn, signer *SSHAgentSigner, passphrase string) {
+	defer conn.Close()
+
+	peerKey, _, err := handshake(conn, signer.signer, passphrase)
+	if err != nil {
+		log.Printf("Handshake failed: %v", err)
+		return
+	}
+	if *verbose {
+		log.Printf("Client connected from %s", publicKeyFingerprint(peerKey))
+	}
+
+	myUsername := publicKeyFingerprint(signer.PublicKey())
+
+	go func() {
+		for {
+			_, message, err := conn.ReadMessage()
+			if err != nil {
+				if *verbose {
+					log.Printf("Client read error: %v", err)
+				}
+				return
+			}
+			fmt.Println(string(message))
+		}
+	}()
+
+	scanner := bufio.NewScanner(os.Stdin)
+	fmt.Printf("Connected as %s. Type messages:\n", myUsername)
+	for scanner.Scan() {
+		text := scanner.Text()
+		if text == "/quit" {
+			break
+		}
+		if *verbose {
+			log.Printf("Sending message: %s", text)
+		}
+		err := conn.WriteMessage(websocket.TextMessage, []byte(text))
+		if err != nil {
+			log.Printf("Write error: %v", err)
+			return
+		}
+	}
 }
 
 func runClient(serverAddr string, signer *SSHAgentSigner, passphrase string) error {
 	url := fmt.Sprintf("ws://%s/ws", serverAddr)
-	log.Printf("Connecting to %s", url)
+	if *verbose {
+		log.Printf("Connecting to %s", url)
+	}
 
 	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
@@ -261,13 +297,16 @@ func runClient(serverAddr string, signer *SSHAgentSigner, passphrase string) err
 	if err != nil {
 		return fmt.Errorf("handshake failed: %w", err)
 	}
+
 	myUsername := publicKeyFingerprint(signer.PublicKey())
 
 	go func() {
 		for {
 			_, message, err := conn.ReadMessage()
 			if err != nil {
-				log.Printf("Read error: %v", err)
+				if *verbose {
+					log.Printf("Read error: %v", err)
+				}
 				os.Exit(1)
 			}
 			fmt.Println(string(message))
@@ -281,7 +320,9 @@ func runClient(serverAddr string, signer *SSHAgentSigner, passphrase string) err
 		if text == "/quit" {
 			break
 		}
-
+		if *verbose {
+			log.Printf("Sending message: %s", text)
+		}
 		err := conn.WriteMessage(websocket.TextMessage, []byte(text))
 		if err != nil {
 			return fmt.Errorf("write error: %w", err)
@@ -322,7 +363,7 @@ func main() {
 			log.Fatalf("Client error: %v", err)
 		}
 	} else {
-		if err := runServer(*listenAddr, *port, signer, pass); err != nil {
+		if err := runServerAsClient(*listenAddr, *port, signer, pass); err != nil {
 			log.Fatalf("Server error: %v", err)
 		}
 	}

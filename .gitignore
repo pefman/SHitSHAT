@@ -2,5 +2,7 @@ server
 server.pub
 client
 client.sub
+client2
+client2.pub
 dist
 token.sh
