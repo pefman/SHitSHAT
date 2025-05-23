@@ -1,0 +1,30 @@
+project_name: shitshat
+
+builds:
+  - id: shitshat
+    binary: shitshat
+    main: ./main.go
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: shitshat-archive
+    format: tar.gz
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+
+release:
+  github:
+    owner: pefman
+    name: shitshat
+  draft: true
+  prerelease: false
